@@ -6,7 +6,7 @@ from .random_forest_model import RandomForestModel
 
 __all__ = [
     'XGBoostModel',
-    'LightGBMModel',
-    'CatBoostModel', 
+    'LightGBMModel', 
+    'CatBoostModel',
     'RandomForestModel'
 ]
