@@ -1,138 +1,194 @@
 # trading_system/utils/calendar.py
-import pandas as pd
-from datetime import datetime, timedelta
-from typing import List, Optional, Dict
-import logging
-from pandas.tseries.holiday import AbstractHolidayCalendar, Holiday, DateOffset, MO
-from pandas.tseries.offsets import CustomBusinessDay
+"""
+Market calendar utilities for Indian stock markets (NSE/BSE).
+Handles trading days, holidays, and market hours.
+"""
 
-class IndianHolidayCalendar(AbstractHolidayCalendar):
-    """
-    Indian Market Holiday Calendar for NSE/BSE
-    """
-    rules = [
-        Holiday('Republic Day', month=1, day=26),
-        Holiday('Holi', month=3, day=7),  # Example date
-        Holiday('Good Friday', month=4, day=2),  # Example date
-        Holiday('Ram Navami', month=4, day=10),  # Example date
-        Holiday('Maharashtra Day', month=5, day=1),
-        Holiday('Bakri Id', month=6, day=29),  # Example date
-        Holiday('Independence Day', month=8, day=15),
-        Holiday('Ganesh Chaturthi', month=9, day=10),  # Example date
-        Holiday('Gandhi Jayanti', month=10, day=2),
-        Holiday('Dussehra', month=10, day=15),  # Example date
-        Holiday('Diwali', month=11, day=14),  # Example date
-        Holiday('Gurunanak Jayanti', month=11, day=27),  # Example date
-        Holiday('Christmas', month=12, day=25)
-    ]
+import pandas as pd
+from datetime import datetime, date, timedelta
+from typing import List, Optional, Dict, Set
+import holidays
+from pathlib import Path
+import json
+import logging
+
+logger = logging.getLogger(__name__)
 
 class MarketCalendar:
     """
-    Market calendar utility for Indian exchanges
+    Indian Stock Market Calendar for NSE and BSE
+    Handles trading days, holidays, and market timing
     """
     
-    def __init__(self, config: Dict):
-        self.config = config
-        self.logger = logging.getLogger(__name__)
-        
-        # Indian business day (Monday to Friday)
-        self.indian_bday = CustomBusinessDay(calendar=IndianHolidayCalendar())
+    def __init__(self, config: Optional[Dict] = None):
+        self.config = config or {}
+        self.country = 'India'
+        self.exchange = 'NSE'  # Default exchange
         
         # Market hours
-        self.market_open = pd.Timestamp("09:15:00").time()
-        self.market_close = pd.Timestamp("15:30:00").time()
+        self.market_open = self.config.get('market_open', '09:15:00')
+        self.market_close = self.config.get('market_close', '15:30:00')
+        self.pre_open_start = self.config.get('pre_open_start', '09:00:00')
+        self.pre_open_end = self.config.get('pre_open_end', '09:08:00')
         
-        # Pre-calculate holidays for performance
-        self._precalculate_holidays()
-    
-    def _precalculate_holidays(self):
-        """Pre-calculate holidays for quick lookup"""
-        start_date = datetime(2000, 1, 1)
-        end_date = datetime(2030, 12, 31)
+        # Initialize holidays
+        self.holidays = self._load_holidays()
         
-        self.holidays = IndianHolidayCalendar().holidays(
-            start=start_date, 
-            end=end_date
-        )
+        # Trading session cache
+        self._trading_days_cache = {}
+        
+        logger.info(f"Market Calendar initialized for {self.exchange}")
     
-    def is_trading_day(self, date: datetime) -> bool:
+    def _load_holidays(self) -> Set[date]:
+        """Load market holidays for Indian exchanges"""
+        # Use python-holidays for India public holidays
+        india_holidays = holidays.India(years=range(2000, 2030))
+        
+        # Add exchange-specific holidays
+        nse_holidays = set()
+        
+        # Major Indian holidays (these are common market holidays)
+        major_holidays = [
+            # Republic Day
+            lambda year: date(year, 1, 26),
+            # Mahashivratri (approximate - varies by year)
+            lambda year: self._get_holiday_date(year, 2, 'maha_shivratri'),
+            # Holi (approximate - varies by year)
+            lambda year: self._get_holiday_date(year, 3, 'holi'),
+            # Good Friday (varies by year)
+            lambda year: self._get_good_friday(year),
+            # Ram Navami (approximate - varies by year)
+            lambda year: self._get_holiday_date(year, 4, 'ram_navami'),
+            # Mahavir Jayanti (approximate)
+            lambda year: self._get_holiday_date(year, 4, 'mahavir_jayanti'),
+            # Independence Day
+            lambda year: date(year, 8, 15),
+            # Gandhi Jayanti
+            lambda year: date(year, 10, 2),
+            # Dussehra (approximate - varies by year)
+            lambda year: self._get_holiday_date(year, 10, 'dussehra'),
+            # Diwali (approximate - varies by year)
+            lambda year: self._get_diwali_date(year),
+            # Gurunanak Jayanti (approximate)
+            lambda year: self._get_holiday_date(year, 11, 'gurunanak_jayanti'),
+            # Christmas
+            lambda year: date(year, 12, 25)
+        ]
+        
+        # Generate holidays for next 30 years
+        current_year = datetime.now().year
+        for year in range(current_year - 10, current_year + 20):
+            for holiday_func in major_holidays:
+                try:
+                    holiday_date = holiday_func(year)
+                    if holiday_date:
+                        nse_holidays.add(holiday_date)
+                except Exception as e:
+                    logger.warning(f"Error calculating holiday for {year}: {e}")
+        
+        # Add to India holidays
+        for holiday in nse_holidays:
+            india_holidays.append(holiday)
+        
+        return set(india_holidays.keys())
+    
+    def _get_good_friday(self, year: int) -> Optional[date]:
+        """Calculate Good Friday date (varies each year)"""
+        # Simple approximation - usually in March or April
+        # In practice, you'd use proper Easter calculation
+        if year == 2023:
+            return date(2023, 4, 7)
+        elif year == 2024:
+            return date(2024, 3, 29)
+        elif year == 2025:
+            return date(2025, 4, 18)
+        else:
+            # Fallback: first Friday of April
+            april_first = date(year, 4, 1)
+            days_to_friday = (4 - april_first.weekday()) % 7
+            return april_first + timedelta(days=days_to_friday - 2)  # Good Friday is 2 days before Easter
+    
+    def _get_diwali_date(self, year: int) -> Optional[date]:
+        """Calculate Diwali date (approximate)"""
+        # Diwali usually in October or November
+        if year == 2023:
+            return date(2023, 11, 12)
+        elif year == 2024:
+            return date(2024, 10, 31)
+        elif year == 2025:
+            return date(2025, 10, 20)
+        else:
+            # Fallback: late October
+            return date(year, 10, 25)
+    
+    def _get_holiday_date(self, year: int, month: int, holiday_name: str) -> Optional[date]:
+        """Get approximate date for floating holidays"""
+        # Simple implementation - in production, use proper lunar calendar
+        holiday_approximations = {
+            'maha_shivratri': date(year, 2, 25),
+            'holi': date(year, 3, 8),
+            'ram_navami': date(year, 4, 2),
+            'mahavir_jayanti': date(year, 4, 14),
+            'dussehra': date(year, 10, 24),
+            'gurunanak_jayanti': date(year, 11, 27)
+        }
+        return holiday_approximations.get(holiday_name)
+    
+    def is_trading_day(self, date_obj: date) -> bool:
         """
-        Check if date is a trading day
+        Check if given date is a trading day
         
         Args:
-            date: Date to check
+            date_obj: Date to check
             
         Returns:
-            True if trading day
+            True if trading day, False otherwise
         """
         # Check if weekend
-        if date.weekday() >= 5:  # Saturday (5) or Sunday (6)
+        if date_obj.weekday() >= 5:  # 5=Saturday, 6=Sunday
             return False
         
         # Check if holiday
-        date_only = date.date()
-        if date_only in [h.date() for h in self.holidays]:
+        if date_obj in self.holidays:
             return False
         
         return True
     
-    def is_market_hours(self, datetime_obj: datetime) -> bool:
-        """
-        Check if current time is within market hours
-        
-        Args:
-            datetime_obj: Datetime to check
-            
-        Returns:
-            True if market is open
-        """
-        if not self.is_trading_day(datetime_obj):
-            return False
-        
-        current_time = datetime_obj.time()
-        return self.market_open <= current_time <= self.market_close
-    
-    def get_previous_trading_day(self, date: datetime) -> datetime:
+    def get_previous_trading_day(self, date_obj: date) -> date:
         """
         Get previous trading day
         
         Args:
-            date: Reference date
+            date_obj: Reference date
             
         Returns:
             Previous trading day
         """
-        current_date = pd.Timestamp(date)
-        prev_date = current_date - self.indian_bday
-        
-        # Ensure we get a valid trading day
-        while not self.is_trading_day(prev_date):
-            prev_date -= self.indian_bday
-        
-        return prev_date.to_pydatetime()
+        current_date = date_obj
+        while True:
+            current_date -= timedelta(days=1)
+            if self.is_trading_day(current_date):
+                return current_date
     
-    def get_next_trading_day(self, date: datetime) -> datetime:
+    def get_next_trading_day(self, date_obj: date) -> date:
         """
         Get next trading day
         
         Args:
-            date: Reference date
+            date_obj: Reference date
             
         Returns:
             Next trading day
         """
-        current_date = pd.Timestamp(date)
-        next_date = current_date + self.indian_bday
-        
-        # Ensure we get a valid trading day
-        while not self.is_trading_day(next_date):
-            next_date += self.indian_bday
-        
-        return next_date.to_pydatetime()
+        current_date = date_obj
+        while True:
+            current_date += timedelta(days=1)
+            if self.is_trading_day(current_date):
+                return current_date
     
-    def get_trading_days_range(self, start_date: datetime, end_date: datetime) -> List[datetime]:
+    def get_trading_days(self, start_date: date, end_date: date) -> List[date]:
         """
-        Get all trading days between start and end dates
+        Get all trading days between start and end date
         
         Args:
             start_date: Start date
@@ -141,51 +197,122 @@ class MarketCalendar:
         Returns:
             List of trading days
         """
-        dates = pd.date_range(start=start_date, end=end_date, freq='D')
-        trading_days = [date for date in dates if self.is_trading_day(date)]
-        return [date.to_pydatetime() for date in trading_days]
+        cache_key = f"{start_date}_{end_date}"
+        if cache_key in self._trading_days_cache:
+            return self._trading_days_cache[cache_key]
+        
+        trading_days = []
+        current_date = start_date
+        
+        while current_date <= end_date:
+            if self.is_trading_day(current_date):
+                trading_days.append(current_date)
+            current_date += timedelta(days=1)
+        
+        self._trading_days_cache[cache_key] = trading_days
+        return trading_days
     
-    def get_trading_days_count(self, start_date: datetime, end_date: datetime) -> int:
+    def get_trading_days_series(self, start_date: date, end_date: date) -> pd.DatetimeIndex:
         """
-        Count number of trading days between dates
+        Get trading days as pandas DatetimeIndex
         
         Args:
             start_date: Start date
             end_date: End date
             
         Returns:
-            Number of trading days
+            DatetimeIndex of trading days
         """
-        trading_days = self.get_trading_days_range(start_date, end_date)
-        return len(trading_days)
+        trading_days = self.get_trading_days(start_date, end_date)
+        return pd.DatetimeIndex(trading_days)
     
-    def add_trading_days(self, date: datetime, n_days: int) -> datetime:
+    def get_holidays(self, start_date: date, end_date: date) -> List[date]:
         """
-        Add n trading days to date
+        Get holidays between start and end date
         
         Args:
-            date: Start date
-            n_days: Number of trading days to add
+            start_date: Start date
+            end_date: End date
             
         Returns:
-            Result date
+            List of holidays
         """
-        current_date = pd.Timestamp(date)
+        holidays_list = []
+        current_date = start_date
         
-        if n_days > 0:
-            for _ in range(n_days):
-                current_date += self.indian_bday
-                while not self.is_trading_day(current_date):
-                    current_date += self.indian_bday
-        else:
-            for _ in range(abs(n_days)):
-                current_date -= self.indian_bday
-                while not self.is_trading_day(current_date):
-                    current_date -= self.indian_bday
+        while current_date <= end_date:
+            if current_date in self.holidays:
+                holidays_list.append(current_date)
+            current_date += timedelta(days=1)
         
-        return current_date.to_pydatetime()
+        return holidays_list
     
-    def get_fortnightly_rebalance_dates(self, start_date: datetime, end_date: datetime) -> List[datetime]:
+    def is_market_open(self, datetime_obj: datetime) -> bool:
+        """
+        Check if market is open at given datetime
+        
+        Args:
+            datetime_obj: Datetime to check
+            
+        Returns:
+            True if market is open
+        """
+        if not self.is_trading_day(datetime_obj.date()):
+            return False
+        
+        time_str = datetime_obj.strftime('%H:%M:%S')
+        return self.market_open <= time_str <= self.market_close
+    
+    def is_pre_open_session(self, datetime_obj: datetime) -> bool:
+        """
+        Check if it's pre-open session
+        
+        Args:
+            datetime_obj: Datetime to check
+            
+        Returns:
+            True if pre-open session
+        """
+        if not self.is_trading_day(datetime_obj.date()):
+            return False
+        
+        time_str = datetime_obj.strftime('%H:%M:%S')
+        return self.pre_open_start <= time_str <= self.pre_open_end
+    
+    def get_market_hours(self) -> Dict[str, str]:
+        """Get market timing information"""
+        return {
+            'pre_open_start': self.pre_open_start,
+            'pre_open_end': self.pre_open_end,
+            'market_open': self.market_open,
+            'market_close': self.market_close
+        }
+    
+    def get_trading_day_range(self, date_obj: date, days: int = 30) -> Dict[str, date]:
+        """
+        Get trading day range around given date
+        
+        Args:
+            date_obj: Reference date
+            days: Number of trading days to look back/forward
+            
+        Returns:
+            Dictionary with start and end dates
+        """
+        end_date = date_obj
+        start_date = end_date
+        
+        # Go back specified number of trading days
+        for _ in range(days):
+            start_date = self.get_previous_trading_day(start_date)
+        
+        return {
+            'start_date': start_date,
+            'end_date': end_date,
+            'trading_days_count': days
+        }
+    
+    def get_fortnightly_rebalance_dates(self, start_date: date, end_date: date) -> List[date]:
         """
         Get fortnightly rebalance dates (every 10 trading days)
         
@@ -196,45 +323,72 @@ class MarketCalendar:
         Returns:
             List of rebalance dates
         """
-        trading_days = self.get_trading_days_range(start_date, end_date)
-        rebalance_days = trading_days[::10]  # Every 10 trading days
+        trading_days = self.get_trading_days(start_date, end_date)
+        rebalance_dates = []
         
-        return rebalance_days
-    
-    def get_market_holidays(self, year: int) -> List[datetime]:
-        """
-        Get market holidays for a specific year
+        for i, trading_day in enumerate(trading_days):
+            if i % 10 == 0:  # Every 10 trading days
+                rebalance_dates.append(trading_day)
         
-        Args:
-            year: Year to get holidays for
-            
-        Returns:
-            List of holiday dates
-        """
-        year_holidays = [h for h in self.holidays if h.year == year]
-        return [h.to_pydatetime() for h in year_holidays]
+        return rebalance_dates
     
-    def get_trading_calendar(self, start_date: datetime, end_date: datetime) -> pd.DataFrame:
+    def validate_date_range(self, start_date: date, end_date: date) -> bool:
         """
-        Get trading calendar between dates
+        Validate date range for trading
         
         Args:
             start_date: Start date
             end_date: End date
             
         Returns:
-            DataFrame with calendar information
+            True if valid date range
         """
-        dates = pd.date_range(start=start_date, end=end_date, freq='D')
+        if start_date > end_date:
+            logger.error("Start date cannot be after end date")
+            return False
         
-        calendar_data = []
-        for date in dates:
-            calendar_data.append({
-                'date': date,
-                'is_trading_day': self.is_trading_day(date),
-                'day_of_week': date.strftime('%A'),
-                'is_weekend': date.weekday() >= 5,
-                'is_holiday': date in self.holidays
-            })
+        trading_days = self.get_trading_days(start_date, end_date)
+        if len(trading_days) == 0:
+            logger.warning("No trading days in specified date range")
+            return False
         
-        return pd.DataFrame(calendar_data)
+        return True
+
+# Utility functions
+def create_market_calendar(config: Optional[Dict] = None) -> MarketCalendar:
+    """Factory function to create market calendar"""
+    return MarketCalendar(config)
+
+def is_weekend(date_obj: date) -> bool:
+    """Check if date is weekend"""
+    return date_obj.weekday() >= 5
+
+def add_trading_days(start_date: date, num_days: int, calendar: MarketCalendar) -> date:
+    """Add trading days to date"""
+    current_date = start_date
+    days_added = 0
+    
+    while days_added < num_days:
+        current_date += timedelta(days=1)
+        if calendar.is_trading_day(current_date):
+            days_added += 1
+    
+    return current_date
+
+# Example usage
+if __name__ == "__main__":
+    # Test market calendar
+    calendar = MarketCalendar()
+    
+    test_date = date(2023, 12, 15)
+    print(f"Is {test_date} a trading day? {calendar.is_trading_day(test_date)}")
+    
+    # Get trading days for a month
+    start_date = date(2023, 12, 1)
+    end_date = date(2023, 12, 31)
+    trading_days = calendar.get_trading_days(start_date, end_date)
+    print(f"Trading days in December 2023: {len(trading_days)}")
+    
+    # Get market hours
+    market_hours = calendar.get_market_hours()
+    print(f"Market hours: {market_hours}")
