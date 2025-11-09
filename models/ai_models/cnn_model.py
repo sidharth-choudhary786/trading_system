@@ -4,13 +4,16 @@ import pandas as pd
 import tensorflow as tf
 from typing import Dict, List, Optional, Tuple
 import logging
+from sklearn.preprocessing import StandardScaler
+import warnings
+warnings.filterwarnings('ignore')
 
-from ...core.exceptions import ModelError
 from ..base_model import BaseModel
+from ...core.exceptions import ModelError
 
 class CNNModel(BaseModel):
     """
-    CNN model for time series pattern recognition
+    CNN model for time series forecasting with 1D convolutions
     """
     
     def __init__(self, config: Dict):
@@ -19,14 +22,15 @@ class CNNModel(BaseModel):
         
         # CNN configuration
         self.sequence_length = config.get('sequence_length', 60)
-        self.conv_filters = config.get('conv_filters', [64, 128, 256])
+        self.filters = config.get('filters', [64, 32, 16])
         self.kernel_sizes = config.get('kernel_sizes', [3, 3, 3])
-        self.dense_units = config.get('dense_units', [128, 64])
+        self.pool_sizes = config.get('pool_sizes', [2, 2, 2])
+        self.dropout_rate = config.get('dropout_rate', 0.2)
         
         # Training configuration
-        self.learning_rate = config.get('learning_rate', 0.001)
         self.epochs = config.get('epochs', 100)
         self.batch_size = config.get('batch_size', 32)
+        self.learning_rate = config.get('learning_rate', 0.001)
         
         # Model components
         self.model = None
@@ -36,53 +40,59 @@ class CNNModel(BaseModel):
         self.logger.info("CNN model initialized")
     
     def build_model(self, input_shape: Tuple) -> tf.keras.Model:
-        """Build CNN model"""
-        inputs = tf.keras.layers.Input(shape=input_shape)
+        """Build CNN model architecture"""
+        model = tf.keras.Sequential()
         
-        x = inputs
+        # Input layer
+        model.add(tf.keras.layers.Input(shape=input_shape))
         
         # CNN layers
-        for filters, kernel_size in zip(self.conv_filters, self.kernel_sizes):
-            x = tf.keras.layers.Conv1D(
+        for i, (filters, kernel_size) in enumerate(zip(self.filters, self.kernel_sizes)):
+            model.add(tf.keras.layers.Conv1D(
                 filters=filters,
                 kernel_size=kernel_size,
                 activation='relu',
                 padding='same'
-            )(x)
-            x = tf.keras.layers.BatchNormalization()(x)
-            x = tf.keras.layers.MaxPooling1D(pool_size=2)(x)
-            x = tf.keras.layers.Dropout(0.2)(x)
+            ))
+            
+            # Add pooling layer
+            if i < len(self.pool_sizes):
+                model.add(tf.keras.layers.MaxPooling1D(
+                    pool_size=self.pool_sizes[i]
+                ))
+            
+            # Add dropout
+            model.add(tf.keras.layers.Dropout(self.dropout_rate))
         
-        # Global pooling and dense layers
-        x = tf.keras.layers.GlobalAveragePooling1D()(x)
+        # Flatten and dense layers
+        model.add(tf.keras.layers.Flatten())
+        model.add(tf.keras.layers.Dense(64, activation='relu'))
+        model.add(tf.keras.layers.Dropout(self.dropout_rate))
+        model.add(tf.keras.layers.Dense(32, activation='relu'))
+        model.add(tf.keras.layers.Dropout(self.dropout_rate))
         
-        for units in self.dense_units:
-            x = tf.keras.layers.Dense(units, activation='relu')(x)
-            x = tf.keras.layers.Dropout(0.3)(x)
+        # Output layer
+        model.add(tf.keras.layers.Dense(1, activation='linear'))
         
-        outputs = tf.keras.layers.Dense(1, activation='linear')(x)
-        
-        model = tf.keras.Model(inputs=inputs, outputs=outputs)
-        
+        # Compile model
         model.compile(
             optimizer=tf.keras.optimizers.Adam(learning_rate=self.learning_rate),
             loss='mse',
-            metrics=['mae']
+            metrics=['mae', 'mape']
         )
         
         return model
     
-    def prepare_data(self, data: pd.DataFrame, target_column: str = 'close') -> Tuple[np.ndarray, np.ndarray]:
+    def prepare_data(self, X: pd.DataFrame, y: pd.Series) -> Tuple[np.ndarray, np.ndarray]:
         """Prepare data for CNN training"""
-        feature_columns = [col for col in data.columns if col != target_column and col != 'date']
-        self.feature_names = feature_columns
+        if len(X) != len(y):
+            raise ModelError("X and y must have same length")
         
-        X = data[feature_columns].values
-        y = data[target_column].values
-        
+        self.feature_names = X.columns.tolist()
         X_scaled = self.scaler.fit_transform(X)
         
-        X_sequences, y_sequences = self._create_sequences(X_scaled, y)
+        # Create sequences
+        X_sequences, y_sequences = self._create_sequences(X_scaled, y.values)
         
         return X_sequences, y_sequences
     
@@ -96,44 +106,126 @@ class CNNModel(BaseModel):
         
         return np.array(X_sequences), np.array(y_sequences)
     
-    def train(self, X_train: np.ndarray, y_train: np.ndarray, 
-              X_val: Optional[np.ndarray] = None, y_val: Optional[np.ndarray] = None) -> Dict:
-        """Train CNN model"""
-        self.logger.info(f"Training CNN with {len(X_train)} sequences")
-        
-        input_shape = (X_train.shape[1], X_train.shape[2])
-        self.model = self.build_model(input_shape)
-        
-        callbacks = [
-            tf.keras.callbacks.EarlyStopping(
-                monitor='val_loss',
-                patience=15,
-                restore_best_weights=True
+    def train(self, X: pd.DataFrame, y: pd.Series):
+        """Train the CNN model"""
+        try:
+            self.logger.info("Starting CNN model training")
+            
+            # Prepare data
+            X_sequences, y_sequences = self.prepare_data(X, y)
+            
+            # Build model
+            input_shape = (X_sequences.shape[1], X_sequences.shape[2])
+            self.model = self.build_model(input_shape)
+            
+            # Callbacks
+            callbacks = [
+                tf.keras.callbacks.EarlyStopping(
+                    monitor='val_loss',
+                    patience=15,
+                    restore_best_weights=True
+                ),
+                tf.keras.callbacks.ReduceLROnPlateau(
+                    monitor='val_loss',
+                    factor=0.5,
+                    patience=8,
+                    min_lr=1e-7
+                )
+            ]
+            
+            # Train model
+            history = self.model.fit(
+                X_sequences,
+                y_sequences,
+                epochs=self.epochs,
+                batch_size=self.batch_size,
+                validation_split=0.2,
+                callbacks=callbacks,
+                verbose=1,
+                shuffle=False
             )
-        ]
-        
-        history = self.model.fit(
-            X_train, y_train,
-            epochs=self.epochs,
-            batch_size=self.batch_size,
-            validation_data=(X_val, y_val) if X_val is not None else None,
-            validation_split=0.2 if X_val is None else 0.0,
-            callbacks=callbacks,
-            verbose=1,
-            shuffle=False
-        )
-        
-        self.is_trained = True
-        
-        return {
-            'history': history.history,
-            'epochs_trained': len(history.history['loss'])
-        }
+            
+            self.is_trained = True
+            self.training_history = history.history
+            
+            self.logger.info("CNN model training completed")
+            
+        except Exception as e:
+            raise ModelError(f"CNN training failed: {e}")
     
-    def predict(self, X: np.ndarray) -> np.ndarray:
+    def predict(self, X: pd.DataFrame) -> pd.Series:
         """Generate predictions"""
         if not self.is_trained:
-            raise ModelError("Model not trained")
+            raise ModelError("Model must be trained before prediction")
         
-        predictions = self.model.predict(X, verbose=0)
-        return predictions.flatten()
+        try:
+            X_scaled = self.scaler.transform(X)
+            X_sequences = self._create_prediction_sequences(X_scaled)
+            
+            predictions = self.model.predict(X_sequences, verbose=0).flatten()
+            
+            # Align predictions
+            start_idx = self.sequence_length
+            end_idx = len(X)
+            aligned_predictions = np.full(len(X), np.nan)
+            aligned_predictions[start_idx:end_idx] = predictions[:end_idx-start_idx]
+            
+            return pd.Series(aligned_predictions, index=X.index)
+            
+        except Exception as e:
+            raise ModelError(f"CNN prediction failed: {e}")
+    
+    def _create_prediction_sequences(self, X: np.ndarray) -> np.ndarray:
+        """Create sequences for prediction"""
+        sequences = []
+        
+        for i in range(self.sequence_length, len(X) + 1):
+            sequences.append(X[i-self.sequence_length:i])
+        
+        return np.array(sequences)
+    
+    def save_model(self, path: str):
+        """Save CNN model"""
+        if not self.is_trained:
+            raise ModelError("No trained model to save")
+        
+        try:
+            self.model.save(f"{path}_model.h5")
+            
+            import joblib
+            joblib.dump({
+                'scaler': self.scaler,
+                'feature_names': self.feature_names,
+                'config': {
+                    'sequence_length': self.sequence_length,
+                    'filters': self.filters,
+                    'kernel_sizes': self.kernel_sizes
+                }
+            }, f"{path}_metadata.pkl")
+            
+            self.logger.info(f"CNN model saved to {path}")
+            
+        except Exception as e:
+            raise ModelError(f"Failed to save CNN model: {e}")
+    
+    def load_model(self, path: str):
+        """Load CNN model"""
+        try:
+            self.model = tf.keras.models.load_model(f"{path}_model.h5")
+            
+            import joblib
+            metadata = joblib.load(f"{path}_metadata.pkl")
+            
+            self.scaler = metadata['scaler']
+            self.feature_names = metadata['feature_names']
+            
+            config = metadata['config']
+            self.sequence_length = config['sequence_length']
+            self.filters = config['filters']
+            self.kernel_sizes = config['kernel_sizes']
+            
+            self.is_trained = True
+            self.logger.info(f"CNN model loaded from {path}")
+            
+        except Exception as e:
+            raise ModelError(f"Failed to load CNN model: {e}")
