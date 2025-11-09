@@ -5,9 +5,11 @@ import tensorflow as tf
 from typing import Dict, List, Optional, Tuple
 import logging
 from sklearn.preprocessing import StandardScaler
+import warnings
+warnings.filterwarnings('ignore')
 
-from ...core.exceptions import ModelError
 from ..base_model import BaseModel
+from ...core.exceptions import ModelError
 
 class TransformerModel(BaseModel):
     """
@@ -27,9 +29,9 @@ class TransformerModel(BaseModel):
         self.dropout_rate = config.get('dropout_rate', 0.1)
         
         # Training configuration
-        self.learning_rate = config.get('learning_rate', 0.001)
         self.epochs = config.get('epochs', 100)
         self.batch_size = config.get('batch_size', 32)
+        self.learning_rate = config.get('learning_rate', 0.001)
         
         # Model components
         self.model = None
@@ -39,96 +41,99 @@ class TransformerModel(BaseModel):
         self.logger.info("Transformer model initialized")
     
     def _transformer_encoder(self, inputs: tf.Tensor) -> tf.Tensor:
-        """Transformer encoder layer"""
+        """Transformer encoder implementation"""
         # Positional encoding
-        x = self._positional_encoding(inputs)
-        
-        # Transformer blocks
-        for _ in range(self.num_layers):
-            x = self._transformer_block(x)
-        
-        return x
-    
-    def _positional_encoding(self, inputs: tf.Tensor) -> tf.Tensor:
-        """Add positional encoding to inputs"""
         seq_len = tf.shape(inputs)[1]
         d_model = inputs.shape[-1]
         
-        # Create positional encoding matrix
-        position = tf.range(seq_len, dtype=tf.float32)[:, tf.newaxis]
-        div_term = tf.exp(tf.range(0, d_model, 2, dtype=tf.float32) * 
-                         -(np.log(10000.0) / d_model))
+        # Create positional encoding
+        angle_rates = 1 / np.power(10000, (2 * (np.arange(d_model)[np.newaxis, :] // 2)) / np.float32(d_model))
+        angle_rads = np.arange(seq_len)[:, np.newaxis] * angle_rates
         
-        pos_encoding = tf.zeros((seq_len, d_model))
-        pos_encoding = tf.tensor_scatter_nd_update(
-            pos_encoding,
-            tf.stack([tf.range(seq_len)[:, tf.newaxis] for _ in range(d_model // 2)], axis=-1),
-            tf.sin(position * div_term)
-        )
-        pos_encoding = tf.tensor_scatter_nd_update(
-            pos_encoding,
-            tf.stack([tf.range(seq_len)[:, tf.newaxis] for _ in range(d_model // 2, d_model)], axis=-1),
-            tf.cos(position * div_term)
-        )
+        # Apply sine to even indices, cosine to odd indices
+        pos_encoding = np.zeros(angle_rads.shape)
+        pos_encoding[:, 0::2] = np.sin(angle_rads[:, 0::2])
+        pos_encoding[:, 1::2] = np.cos(angle_rads[:, 1::2])
         
-        return inputs + pos_encoding[tf.newaxis, :, :]
-    
-    def _transformer_block(self, x: tf.Tensor) -> tf.Tensor:
-        """Single transformer block"""
-        # Multi-head attention
-        attn_output = tf.keras.layers.MultiHeadAttention(
-            num_heads=self.num_heads,
-            key_dim=self.d_model // self.num_heads
-        )(x, x)
-        attn_output = tf.keras.layers.Dropout(self.dropout_rate)(attn_output)
-        x = tf.keras.layers.LayerNormalization(epsilon=1e-6)(x + attn_output)
+        pos_encoding = tf.cast(pos_encoding, dtype=tf.float32)
         
-        # Feed forward network
-        ffn_output = tf.keras.layers.Dense(self.dff, activation='relu')(x)
-        ffn_output = tf.keras.layers.Dense(self.d_model)(ffn_output)
-        ffn_output = tf.keras.layers.Dropout(self.dropout_rate)(ffn_output)
-        x = tf.keras.layers.LayerNormalization(epsilon=1e-6)(x + ffn_output)
+        # Add positional encoding to input
+        inputs += pos_encoding
         
-        return x
+        # Dropout
+        inputs = tf.keras.layers.Dropout(self.dropout_rate)(inputs)
+        
+        # Transformer layers
+        for _ in range(self.num_layers):
+            # Multi-head attention
+            attention_output = tf.keras.layers.MultiHeadAttention(
+                num_heads=self.num_heads,
+                key_dim=self.d_model // self.num_heads,
+                dropout=self.dropout_rate
+            )(inputs, inputs)
+            
+            # Add & Norm
+            attention_output = tf.keras.layers.LayerNormalization(epsilon=1e-6)(
+                inputs + attention_output
+            )
+            
+            # Feed forward
+            ffn_output = tf.keras.Sequential([
+                tf.keras.layers.Dense(self.dff, activation='relu'),
+                tf.keras.layers.Dense(self.d_model),
+                tf.keras.layers.Dropout(self.dropout_rate)
+            ])(attention_output)
+            
+            # Add & Norm
+            inputs = tf.keras.layers.LayerNormalization(epsilon=1e-6)(
+                attention_output + ffn_output
+            )
+        
+        return inputs
     
     def build_model(self, input_shape: Tuple) -> tf.keras.Model:
         """Build transformer model"""
-        inputs = tf.keras.layers.Input(shape=input_shape)
+        inputs = tf.keras.Input(shape=input_shape)
         
-        # Feature projection
+        # Project input to d_model dimensions
         x = tf.keras.layers.Dense(self.d_model)(inputs)
         
         # Transformer encoder
         x = self._transformer_encoder(x)
         
-        # Global average pooling and output
+        # Global average pooling
         x = tf.keras.layers.GlobalAveragePooling1D()(x)
+        
+        # Dense layers
         x = tf.keras.layers.Dense(64, activation='relu')(x)
         x = tf.keras.layers.Dropout(self.dropout_rate)(x)
         x = tf.keras.layers.Dense(32, activation='relu')(x)
+        x = tf.keras.layers.Dropout(self.dropout_rate)(x)
+        
+        # Output layer
         outputs = tf.keras.layers.Dense(1, activation='linear')(x)
         
         model = tf.keras.Model(inputs=inputs, outputs=outputs)
         
+        # Compile model
         model.compile(
             optimizer=tf.keras.optimizers.Adam(learning_rate=self.learning_rate),
             loss='mse',
-            metrics=['mae']
+            metrics=['mae', 'mape']
         )
         
         return model
     
-    def prepare_data(self, data: pd.DataFrame, target_column: str = 'close') -> Tuple[np.ndarray, np.ndarray]:
+    def prepare_data(self, X: pd.DataFrame, y: pd.Series) -> Tuple[np.ndarray, np.ndarray]:
         """Prepare data for transformer training"""
-        feature_columns = [col for col in data.columns if col != target_column and col != 'date']
-        self.feature_names = feature_columns
+        if len(X) != len(y):
+            raise ModelError("X and y must have same length")
         
-        X = data[feature_columns].values
-        y = data[target_column].values
-        
+        self.feature_names = X.columns.tolist()
         X_scaled = self.scaler.fit_transform(X)
         
-        X_sequences, y_sequences = self._create_sequences(X_scaled, y)
+        # Create sequences
+        X_sequences, y_sequences = self._create_sequences(X_scaled, y.values)
         
         return X_sequences, y_sequences
     
@@ -142,44 +147,126 @@ class TransformerModel(BaseModel):
         
         return np.array(X_sequences), np.array(y_sequences)
     
-    def train(self, X_train: np.ndarray, y_train: np.ndarray, 
-              X_val: Optional[np.ndarray] = None, y_val: Optional[np.ndarray] = None) -> Dict:
-        """Train transformer model"""
-        self.logger.info(f"Training Transformer with {len(X_train)} sequences")
-        
-        input_shape = (X_train.shape[1], X_train.shape[2])
-        self.model = self.build_model(input_shape)
-        
-        callbacks = [
-            tf.keras.callbacks.EarlyStopping(
-                monitor='val_loss',
-                patience=10,
-                restore_best_weights=True
+    def train(self, X: pd.DataFrame, y: pd.Series):
+        """Train the transformer model"""
+        try:
+            self.logger.info("Starting Transformer model training")
+            
+            # Prepare data
+            X_sequences, y_sequences = self.prepare_data(X, y)
+            
+            # Build model
+            input_shape = (X_sequences.shape[1], X_sequences.shape[2])
+            self.model = self.build_model(input_shape)
+            
+            # Callbacks
+            callbacks = [
+                tf.keras.callbacks.EarlyStopping(
+                    monitor='val_loss',
+                    patience=15,
+                    restore_best_weights=True
+                ),
+                tf.keras.callbacks.ReduceLROnPlateau(
+                    monitor='val_loss',
+                    factor=0.5,
+                    patience=8,
+                    min_lr=1e-7
+                )
+            ]
+            
+            # Train model
+            history = self.model.fit(
+                X_sequences,
+                y_sequences,
+                epochs=self.epochs,
+                batch_size=self.batch_size,
+                validation_split=0.2,
+                callbacks=callbacks,
+                verbose=1,
+                shuffle=False
             )
-        ]
-        
-        history = self.model.fit(
-            X_train, y_train,
-            epochs=self.epochs,
-            batch_size=self.batch_size,
-            validation_data=(X_val, y_val) if X_val is not None else None,
-            validation_split=0.2 if X_val is None else 0.0,
-            callbacks=callbacks,
-            verbose=1,
-            shuffle=False
-        )
-        
-        self.is_trained = True
-        
-        return {
-            'history': history.history,
-            'epochs_trained': len(history.history['loss'])
-        }
+            
+            self.is_trained = True
+            self.training_history = history.history
+            
+            self.logger.info("Transformer model training completed")
+            
+        except Exception as e:
+            raise ModelError(f"Transformer training failed: {e}")
     
-    def predict(self, X: np.ndarray) -> np.ndarray:
+    def predict(self, X: pd.DataFrame) -> pd.Series:
         """Generate predictions"""
         if not self.is_trained:
-            raise ModelError("Model not trained")
+            raise ModelError("Model must be trained before prediction")
         
-        predictions = self.model.predict(X, verbose=0)
-        return predictions.flatten()
+        try:
+            X_scaled = self.scaler.transform(X)
+            X_sequences = self._create_prediction_sequences(X_scaled)
+            
+            predictions = self.model.predict(X_sequences, verbose=0).flatten()
+            
+            # Align predictions
+            start_idx = self.sequence_length
+            end_idx = len(X)
+            aligned_predictions = np.full(len(X), np.nan)
+            aligned_predictions[start_idx:end_idx] = predictions[:end_idx-start_idx]
+            
+            return pd.Series(aligned_predictions, index=X.index)
+            
+        except Exception as e:
+            raise ModelError(f"Transformer prediction failed: {e}")
+    
+    def _create_prediction_sequences(self, X: np.ndarray) -> np.ndarray:
+        """Create sequences for prediction"""
+        sequences = []
+        
+        for i in range(self.sequence_length, len(X) + 1):
+            sequences.append(X[i-self.sequence_length:i])
+        
+        return np.array(sequences)
+    
+    def save_model(self, path: str):
+        """Save transformer model"""
+        if not self.is_trained:
+            raise ModelError("No trained model to save")
+        
+        try:
+            self.model.save(f"{path}_model.h5")
+            
+            import joblib
+            joblib.dump({
+                'scaler': self.scaler,
+                'feature_names': self.feature_names,
+                'config': {
+                    'sequence_length': self.sequence_length,
+                    'd_model': self.d_model,
+                    'num_heads': self.num_heads
+                }
+            }, f"{path}_metadata.pkl")
+            
+            self.logger.info(f"Transformer model saved to {path}")
+            
+        except Exception as e:
+            raise ModelError(f"Failed to save transformer model: {e}")
+    
+    def load_model(self, path: str):
+        """Load transformer model"""
+        try:
+            self.model = tf.keras.models.load_model(f"{path}_model.h5")
+            
+            import joblib
+            metadata = joblib.load(f"{path}_metadata.pkl")
+            
+            self.scaler = metadata['scaler']
+            self.feature_names = metadata['feature_names']
+            
+            config = metadata['config']
+            self.sequence_length = config['sequence_length']
+            self.d_model = config['d_model']
+            self.num_heads = config['num_heads']
+            
+            self.is_trained = True
+            self.logger.info(f"Transformer model loaded from {path}")
+            
+        except Exception as e:
+            raise ModelError(f"Failed to load transformer model: {e}")
