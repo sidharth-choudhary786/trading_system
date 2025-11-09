@@ -11,13 +11,15 @@ class MockModel:
     def train(self, X, y):
         """Mock training"""
         self.is_trained = True
-        return {'loss': 0.1, 'accuracy': 0.8}
+        return {'loss': 0.1, 'accuracy': 0.85}
     
     def predict(self, X):
         """Mock prediction"""
         if not self.is_trained:
             raise ValueError("Model not trained")
-        return np.random.choice([0, 1], len(X))
+        
+        # Return random predictions
+        return np.random.choice([0, 1], size=len(X))
     
     def save(self, path):
         """Mock save"""
