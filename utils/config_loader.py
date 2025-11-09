@@ -1,11 +1,18 @@
 # trading_system/utils/config_loader.py
-import os
+"""
+Configuration management utilities for the trading system.
+Handles YAML configuration files, environment variables, and validation.
+"""
+
 import yaml
-from typing import Dict, Any, Optional
+import os
+from typing import Dict, Any, Optional, List
 from pathlib import Path
 import logging
+from dotenv import load_dotenv
+import json
 
-from ..core.exceptions import TradingSystemError
+logger = logging.getLogger(__name__)
 
 class ConfigLoader:
     """
@@ -18,9 +25,14 @@ class ConfigLoader:
         self.logger = logging.getLogger(__name__)
         self._config_cache = {}
         
+        # Load environment variables
+        load_dotenv()
+        
         # Ensure config directory exists
         if not self.config_dir.exists():
             raise TradingSystemError(f"Config directory not found: {config_dir}")
+        
+        logger.info(f"ConfigLoader initialized with directory: {config_dir}")
     
     def load_config(self, mode: str = "backtest") -> Dict[str, Any]:
         """
@@ -72,13 +84,20 @@ class ConfigLoader:
         if not file_path.exists():
             raise TradingSystemError(f"Config file not found: {file_path}")
         
-        with open(file_path, 'r', encoding='utf-8') as file:
-            config = yaml.safe_load(file)
-        
-        if config is None:
-            config = {}
+        try:
+            with open(file_path, 'r', encoding='utf-8') as file:
+                config = yaml.safe_load(file)
             
-        return config
+            if config is None:
+                config = {}
+                
+            self.logger.debug(f"Loaded config from {filename}")
+            return config
+            
+        except yaml.YAMLError as e:
+            raise TradingSystemError(f"Error parsing YAML file {filename}: {e}")
+        except Exception as e:
+            raise TradingSystemError(f"Error reading config file {filename}: {e}")
     
     def _deep_merge(self, base: Dict, override: Dict) -> Dict:
         """Deep merge two dictionaries"""
@@ -101,7 +120,11 @@ class ConfigLoader:
             return [self._resolve_env_vars(item) for item in config]
         elif isinstance(config, str) and config.startswith("${") and config.endswith("}"):
             env_var = config[2:-1]
-            return os.getenv(env_var, config)
+            env_value = os.getenv(env_var)
+            if env_value is None:
+                self.logger.warning(f"Environment variable {env_var} not found")
+                return config
+            return env_value
         else:
             return config
     
@@ -173,30 +196,149 @@ class ConfigLoader:
         if filepath is None:
             filepath = self.config_dir / f"{mode}_current.yaml"
         
-        with open(filepath, 'w', encoding='utf-8') as file:
-            yaml.dump(self._config_cache[mode], file, default_flow_style=False)
+        try:
+            with open(filepath, 'w', encoding='utf-8') as file:
+                yaml.dump(self._config_cache[mode], file, default_flow_style=False, indent=2)
+                
+            self.logger.info(f"Configuration saved to: {filepath}")
             
-        self.logger.info(f"Configuration saved to: {filepath}")
+        except Exception as e:
+            raise TradingSystemError(f"Error saving configuration: {e}")
     
-    def list_available_modes(self) -> List[str]:
-        """List available configuration modes"""
-        modes = []
-        for file in self.config_dir.glob("*.yaml"):
-            if file.stem in ['backtest', 'production', 'shared']:
-                modes.append(file.stem)
-        return modes
-    
-    def get_config_info(self, mode: str) -> Dict:
-        """Get information about configuration"""
-        config = self.load_config(mode)
+    def create_config_template(self, mode: str, filepath: str):
+        """
+        Create configuration template for given mode
         
-        info = {
+        Args:
+            mode: Configuration mode
+            filepath: Output file path
+        """
+        template = self._get_config_template(mode)
+        
+        try:
+            with open(filepath, 'w', encoding='utf-8') as file:
+                yaml.dump(template, file, default_flow_style=False, indent=2)
+                
+            self.logger.info(f"Configuration template created: {filepath}")
+            
+        except Exception as e:
+            raise TradingSystemError(f"Error creating configuration template: {e}")
+    
+    def _get_config_template(self, mode: str) -> Dict[str, Any]:
+        """Get configuration template for mode"""
+        base_template = {
             'mode': mode,
-            'sections': list(config.keys()),
-            'data_sources': config.get('data', {}).get('sources', []),
-            'active_models': config.get('models', {}).get('active_models', []),
-            'optimization_method': config.get('portfolio', {}).get('optimization_method'),
-            'risk_limits': config.get('risk', {}).get('constraints', {})
+            'description': f'Trading system configuration for {mode} mode',
+            'version': '1.0.0'
         }
         
-        return info
+        if mode == 'backtest':
+            base_template.update({
+                'backtest': {
+                    'initial_capital': 1000000,
+                    'start_date': '2020-01-01',
+                    'end_date': '2023-12-31',
+                    'commission': 0.001,
+                    'slippage': 0.001
+                }
+            })
+        elif mode == 'production':
+            base_template.update({
+                'production': {
+                    'live_trading': False,
+                    'paper_trading': True,
+                    'broker': 'zerodha'
+                }
+            })
+        
+        return base_template
+    
+    def validate_config_file(self, filepath: str) -> bool:
+        """
+        Validate configuration file
+        
+        Args:
+            filepath: Path to configuration file
+            
+        Returns:
+            True if valid
+        """
+        try:
+            with open(filepath, 'r', encoding='utf-8') as file:
+                config = yaml.safe_load(file)
+            
+            # Basic structure validation
+            if not isinstance(config, dict):
+                self.logger.error("Configuration must be a dictionary")
+                return False
+            
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Configuration validation failed: {e}")
+            return False
+    
+    def get_config_stats(self, mode: str) -> Dict[str, Any]:
+        """
+        Get configuration statistics
+        
+        Args:
+            mode: Configuration mode
+            
+        Returns:
+            Configuration statistics
+        """
+        if mode not in self._config_cache:
+            self.load_config(mode)
+        
+        config = self._config_cache[mode]
+        
+        def count_keys(d):
+            if isinstance(d, dict):
+                return sum(count_keys(v) for v in d.values()) + len(d)
+            elif isinstance(d, list):
+                return sum(count_keys(item) for item in d)
+            else:
+                return 1
+        
+        total_keys = count_keys(config)
+        
+        return {
+            'mode': mode,
+            'total_keys': total_keys,
+            'sections': list(config.keys()),
+            'data_sources': self.get_config_value(config, 'data.sources', []),
+            'active_models': self.get_config_value(config, 'models.active_models', [])
+        }
+
+class TradingSystemError(Exception):
+    """Base exception for trading system configuration errors"""
+    pass
+
+# Utility functions
+def load_config(mode: str = "backtest", config_dir: str = "config") -> Dict[str, Any]:
+    """Convenience function to load configuration"""
+    loader = ConfigLoader(config_dir)
+    return loader.load_config(mode)
+
+def get_config_value(config: Dict, key_path: str, default: Any = None) -> Any:
+    """Convenience function to get config value"""
+    return ConfigLoader.get_config_value(config, key_path, default)
+
+# Example usage
+if __name__ == "__main__":
+    # Test configuration loading
+    try:
+        config_loader = ConfigLoader()
+        config = config_loader.load_config("backtest")
+        
+        print("Configuration loaded successfully!")
+        print(f"Mode: {config.get('mode', 'N/A')}")
+        print(f"Initial Capital: {config_loader.get_config_value(config, 'backtest.initial_capital', 'N/A')}")
+        
+        # Get configuration statistics
+        stats = config_loader.get_config_stats("backtest")
+        print(f"Configuration stats: {stats}")
+        
+    except Exception as e:
+        print(f"Configuration loading failed: {e}")
