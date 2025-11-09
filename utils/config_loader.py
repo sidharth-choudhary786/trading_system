@@ -177,3 +177,26 @@ class ConfigLoader:
             yaml.dump(self._config_cache[mode], file, default_flow_style=False)
             
         self.logger.info(f"Configuration saved to: {filepath}")
+    
+    def list_available_modes(self) -> List[str]:
+        """List available configuration modes"""
+        modes = []
+        for file in self.config_dir.glob("*.yaml"):
+            if file.stem in ['backtest', 'production', 'shared']:
+                modes.append(file.stem)
+        return modes
+    
+    def get_config_info(self, mode: str) -> Dict:
+        """Get information about configuration"""
+        config = self.load_config(mode)
+        
+        info = {
+            'mode': mode,
+            'sections': list(config.keys()),
+            'data_sources': config.get('data', {}).get('sources', []),
+            'active_models': config.get('models', {}).get('active_models', []),
+            'optimization_method': config.get('portfolio', {}).get('optimization_method'),
+            'risk_limits': config.get('risk', {}).get('constraints', {})
+        }
+        
+        return info
