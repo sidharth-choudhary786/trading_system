@@ -18,11 +18,3 @@ features:
 
 models:
   active_models: ["mock"]
-  walk_forward:
-    window_size: 100
-    step_size: 10
-
-risk:
-  max_daily_loss: 0.02
-  max_drawdown: 0.15
-  max_position_size: 0.1
